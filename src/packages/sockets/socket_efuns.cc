@@ -11,9 +11,17 @@
 
 #include <errno.h>
 #include <event2/util.h>
+#include <sys/un.h>
+#include <string.h>
 #include <deque>
 #include <string>
 #include <unistd.h>  // for close
+#include <cstdint>
+
+#define OFFSET_OF(TYPE, MEMBER) \
+((int)((intptr_t)&((TYPE *)0)->MEMBER))
+/* https://stackoverflow.com/questions/1640423/error-cast-from-void-to-int-loses-precision */
+
 
 #if defined(PACKAGE_SOCKETS) || defined(PACKAGE_EXTERNAL)
 
@@ -24,6 +32,14 @@ struct lpc_socket_event_data {
 namespace {
 // Hold all the LPC socks
 std::deque<lpc_socket_t> lpc_socks;
+
+static void
+path_to_sockaddr(const char* path, struct sockaddr_un *addr, socklen_t *len)
+{
+	addr->sun_family = AF_UNIX;
+	strcpy(addr->sun_path, path);
+	*len = OFFSET_OF(struct sockaddr_un, sun_path) + strlen(path);	
+}
 
 void on_lpc_sock_read(evutil_socket_t fd, short what, void *arg) {
   debug(event, "Got an event on socket %d:%s%s%s%s \n", (int)fd,
@@ -322,9 +338,11 @@ int socket_create(enum socket_mode mode, svalue_t *read_callback, svalue_t *clos
 #endif
   switch (mode) {
     case MUD:
+	case STREAM_UN:
     case STREAM:
       type = SOCK_STREAM;
       break;
+	case DATAGRAM_UN:
     case DATAGRAM:
       type = SOCK_DGRAM;
       break;
@@ -334,11 +352,15 @@ int socket_create(enum socket_mode mode, svalue_t *read_callback, svalue_t *clos
   }
   i = find_new_socket();
   if (i >= 0) {
+	  if (mode == DATAGRAM_UN || mode == STREAM_UN) {
+		  fd = socket(AF_UNIX, type, 0);
+	  } else {
 #ifdef IPV6
-    fd = socket(AF_INET6, type, 0);
+		  fd = socket(AF_INET6, type, 0);
 #else
-    fd = socket(AF_INET, type, 0);
+		  fd = socket(AF_INET, type, 0);
 #endif
+	  }
     if (fd == -1) {
       debug(sockets, "socket_create: socket error: %s.\n",
             evutil_socket_error_to_string(evutil_socket_geterror(fd)));
@@ -419,46 +441,51 @@ int socket_bind(int fd, int port, const char *addr) {
 
   struct sockaddr_storage sockaddr = {0};
   socklen_t len = sizeof(sockaddr);
-
-  if (addr != nullptr) {
-    if (!lpcaddr_to_sockaddr(addr, reinterpret_cast<struct sockaddr *>(&sockaddr), &len)) {
-      debug(sockets, "socket_bind: unable to parse: '%s'.\n", addr);
-      return EEBADADDR;
-    }
+  
+  if (lpc_socks[fd].mode == STREAM_UN || lpc_socks[fd].mode == DATAGRAM_UN) {
+	path_to_sockaddr(addr, reinterpret_cast<struct sockaddr_un*>(&sockaddr), &len);
   } else {
-    char service[NI_MAXSERV];
-    snprintf(service, sizeof(service), "%u", port);
 
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(struct addrinfo));
+	if (addr != nullptr) {
+	  if (!lpcaddr_to_sockaddr(addr, reinterpret_cast<struct sockaddr *>(&sockaddr), &len)) {
+		debug(sockets, "socket_bind: unable to parse: '%s'.\n", addr);
+		return EEBADADDR;
+	  }
+	} else {
+	  char service[NI_MAXSERV];
+	  snprintf(service, sizeof(service), "%u", port);
+
+	  struct addrinfo hints;
+	  memset(&hints, 0, sizeof(struct addrinfo));
 #ifdef IPV6
-    hints.ai_family = AF_INET6;
+	  hints.ai_family = AF_INET6;
 #else
-    hints.ai_family = AF_INET;
+	  hints.ai_family = AF_INET;
 #endif
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE | AI_V4MAPPED;
-    hints.ai_protocol = 0; /* Any protocol */
+	  hints.ai_socktype = SOCK_STREAM;
+	  hints.ai_flags = AI_PASSIVE | AI_V4MAPPED;
+	  hints.ai_protocol = 0; /* Any protocol */
 
-    int ret;
-    struct addrinfo *result = NULL;
+	  int ret;
+	  struct addrinfo *result = NULL;
 
-    auto mudip = CONFIG_STR(__MUD_IP__);
-    if (mudip != nullptr && strlen(mudip) > 0) {
-      debug(sockets, "socket_bind: binding to mud ip: %s.\n", mudip);
-      ret = getaddrinfo(mudip, service, &hints, &result);
-    } else {
-      debug(sockets, "socket_bind: binding to any address.\n");
-      ret = getaddrinfo(NULL, service, &hints, &result);
-    }
-    if (ret) {
-      debug(sockets, "socket_bind: error %s \n", gai_strerror(ret));
-      return EEBADADDR;
-    }
+	  auto mudip = CONFIG_STR(__MUD_IP__);
+	  if (mudip != nullptr && strlen(mudip) > 0) {
+		debug(sockets, "socket_bind: binding to mud ip: %s.\n", mudip);
+		ret = getaddrinfo(mudip, service, &hints, &result);
+	  } else {
+		debug(sockets, "socket_bind: binding to any address.\n");
+		ret = getaddrinfo(NULL, service, &hints, &result);
+	  }
+	  if (ret) {
+		debug(sockets, "socket_bind: error %s \n", gai_strerror(ret));
+		return EEBADADDR;
+	  }
 
-    memcpy(&sockaddr, result->ai_addr, result->ai_addrlen);
-    len = result->ai_addrlen;
-    freeaddrinfo(result);
+	  memcpy(&sockaddr, result->ai_addr, result->ai_addrlen);
+	  len = result->ai_addrlen;
+	  freeaddrinfo(result);
+	}
   }
 
   if (bind(lpc_socks[fd].fd, reinterpret_cast<struct sockaddr *>(&sockaddr), len) == -1) {
@@ -488,7 +515,7 @@ int socket_bind(int fd, int port, const char *addr) {
         sockaddr_to_string((struct sockaddr *)&lpc_socks[fd].l_addr, lpc_socks[fd].l_addrlen));
 
   // register read event.
-  if (lpc_socks[fd].mode == DATAGRAM || lpc_socks[fd].mode == DATAGRAM_BINARY) {
+  if (lpc_socks[fd].mode == DATAGRAM || lpc_socks[fd].mode == DATAGRAM_BINARY || lpc_socks[fd].mode== DATAGRAM_UN) {
     event_add(lpc_socks[fd].ev_read, NULL);
   }
 
@@ -508,7 +535,7 @@ int socket_listen(int fd, svalue_t *callback) {
   if (lpc_socks[fd].owner_ob != current_object) {
     return EESECURITY;
   }
-  if (lpc_socks[fd].mode == DATAGRAM) {
+  if (lpc_socks[fd].mode == DATAGRAM || lpc_socks[fd].mode == DATAGRAM_UN)  {
     return EEMODENOTSUPP;
   }
   if (lpc_socks[fd].state == STATE_UNBOUND) {
@@ -551,7 +578,7 @@ int socket_accept(int fd, svalue_t *read_callback, svalue_t *write_callback) {
   if (lpc_socks[fd].owner_ob != current_object) {
     return EESECURITY;
   }
-  if (lpc_socks[fd].mode == DATAGRAM) {
+  if (lpc_socks[fd].mode == DATAGRAM || lpc_socks[fd].mode == DATAGRAM_UN) {
     return EEMODENOTSUPP;
   }
   if (lpc_socks[fd].state != STATE_LISTEN) {
@@ -639,7 +666,7 @@ int socket_connect(int fd, const char *name, svalue_t *read_callback, svalue_t *
   if (lpc_socks[fd].owner_ob != current_object) {
     return EESECURITY;
   }
-  if (lpc_socks[fd].mode == DATAGRAM) {
+  if (lpc_socks[fd].mode == DATAGRAM || lpc_socks[fd].mode == DATAGRAM_UN) {
     return EEMODENOTSUPP;
   }
   switch (lpc_socks[fd].state) {
@@ -654,10 +681,17 @@ int socket_connect(int fd, const char *name, svalue_t *read_callback, svalue_t *
       return EEISCONN;
   }
 
-  if (!lpcaddr_to_sockaddr(name, reinterpret_cast<sockaddr *>(&lpc_socks[fd].r_addr),
-                           &lpc_socks[fd].r_addrlen)) {
-    debug(sockets, "socket_connect: bad address: %s.\n", name);
-    return EEBADADDR;
+  if (lpc_socks[fd].mode == STREAM) {
+	  if (!lpcaddr_to_sockaddr(name, reinterpret_cast<sockaddr *>(&lpc_socks[fd].r_addr),
+				  &lpc_socks[fd].r_addrlen)) {
+		  debug(sockets, "socket_connect: bad address: %s.\n", name);
+		  return EEBADADDR;
+	  }
+  }
+
+  if (lpc_socks[fd].mode == STREAM_UN) {
+	  path_to_sockaddr(name, reinterpret_cast<struct sockaddr_un*>(&lpc_socks[fd].r_addr),
+			  &lpc_socks[fd].r_addrlen);
   }
 
   set_read_callback(fd, read_callback);
@@ -725,6 +759,8 @@ int socket_write(int fd, svalue_t *message, const char *name) {
     if (!lpcaddr_to_sockaddr(name, reinterpret_cast<sockaddr *>(&addr), &addrlen)) {
       return EEBADADDR;
     }
+  } else if (lpc_socks[fd].mode == DATAGRAM_UN) {
+		path_to_sockaddr(name, reinterpret_cast<struct sockaddr_un*>(&addr), &addrlen);
   } else {
     if (lpc_socks[fd].state != STATE_DATA_XFER) {
       return EENOTCONN;
@@ -764,6 +800,7 @@ int socket_write(int fd, svalue_t *message, const char *name) {
       }
       break;
 
+	case STREAM_UN:
     case STREAM:
       debug(sockets, "socket_write: sending tcp message to %s\n",
             sockaddr_to_string((struct sockaddr *)&lpc_socks[fd].r_addr, lpc_socks[fd].r_addrlen));
@@ -829,6 +866,7 @@ int socket_write(int fd, svalue_t *message, const char *name) {
       }
       break;
 
+	case DATAGRAM_UN:
     case DATAGRAM:
       debug(sockets, "socket_write: sending udp message to %s\n",
             sockaddr_to_string((struct sockaddr *)&addr, addrlen));
@@ -978,6 +1016,7 @@ void socket_read_select_handler(int fd) {
         case STREAM:
           break;
 
+		case DATAGRAM_UN:
         case DATAGRAM: {
           char addr[NI_MAXHOST + NI_MAXSERV];
           debug(sockets, ("read_socket_handler: DATA_XFER DATAGRAM\n"));
@@ -1000,16 +1039,21 @@ void socket_read_select_handler(int fd) {
           // Translate socket address into "address port" format.
           {
             char host[NI_MAXHOST], service[NI_MAXSERV];
-            int ret = getnameinfo(reinterpret_cast<struct sockaddr *>(&sockaddr), addrlen, host,
-                                  sizeof(host), service, sizeof(service),
-                                  NI_NUMERICHOST | NI_NUMERICSERV);
-            if (ret) {
-              debug(sockets, "socket_read_select_handler: bad addr: %s", gai_strerror(ret));
-              addr[0] = '\0';
-            } else {
-              sprintf(addr, "%s %s", host, service);
-            }
-          }
+			if (lpc_socks[fd].mode == DATAGRAM_UN) {
+				struct sockaddr_un* addr_un = reinterpret_cast<struct sockaddr_un*>(&sockaddr);
+				strcpy(addr, addr_un->sun_path);
+			} else {	
+				int ret = getnameinfo(reinterpret_cast<struct sockaddr *>(&sockaddr), addrlen, host,
+						sizeof(host), service, sizeof(service),
+						NI_NUMERICHOST | NI_NUMERICSERV);
+				if (ret) {
+					debug(sockets, "socket_read_select_handler: bad addr: %s", gai_strerror(ret));
+					addr[0] = '\0';
+				} else {
+					sprintf(addr, "%s %s", host, service);
+				}
+			}
+		  }
           push_number(fd);
 #ifndef NO_BUFFER_TYPE
           if (lpc_socks[fd].flags & S_BINARY) {
@@ -1047,6 +1091,7 @@ void socket_read_select_handler(int fd) {
 
     case STATE_DATA_XFER:
       switch (lpc_socks[fd].mode) {
+		case DATAGRAM_UN:
         case DATAGRAM:
           break;
 
@@ -1124,7 +1169,8 @@ void socket_read_select_handler(int fd) {
           debug(sockets, ("read_socket_handler: apply read callback\n"));
           call_callback(fd, S_READ_FP, 2);
           return;
-
+		
+		case STREAM_UN:
         case STREAM:
           debug(sockets, ("read_socket_handler: DATA_XFER STREAM\n"));
           cc = recv(lpc_socks[fd].fd, buf, sizeof(buf) - 1, 0);

@@ -11,7 +11,8 @@
 #include <deque>
 #include <event2/util.h>
 
-enum socket_mode { MUD, STREAM, DATAGRAM, STREAM_BINARY, DATAGRAM_BINARY };
+enum socket_mode { MUD, STREAM, DATAGRAM, STREAM_BINARY, DATAGRAM_BINARY,
+				   STREAM_UN, DATAGRAM_UN };
 
 enum socket_state {
   STATE_CLOSED,
